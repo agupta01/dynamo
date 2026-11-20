@@ -24,6 +24,7 @@
 use super::*;
 
 pub mod aic_callback;
+mod decisions;
 pub mod entrypoint;
 pub mod fpm;
 pub mod frontend_routes;

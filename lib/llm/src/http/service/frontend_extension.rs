@@ -1,23 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Extension point for the HTTP frontend (currently: static GET routes).
-//! The context is a narrow, read-only view of live frontend state, so
-//! extensions have the same capability in any language. Grow it with typed
-//! read-only accessors as needed.
+//! HTTP frontend extensions: system GET routes and the opt-in Decisions inference route.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::protocols::openai::pooling::{
+    NvCreatePoolingRequest, PoolingEmbedDType, PoolingEncodingFormat, PoolingEndianness,
+    PoolingInput, PoolingOutput,
+};
 use axum::Router;
 use axum::handler::Handler;
 use axum::http::Method;
-use axum::routing::get;
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::{get, post};
+use base64::Engine as _;
 
 use super::RouteDoc;
 use super::service_v2::State;
 
-/// Live, read-only view of frontend state exposed to extensions (typed
+/// Live view of frontend state exposed to extensions (typed
 /// accessors only, not the internal `State`/`ModelManager`).
 #[derive(Clone)]
 pub struct FrontendExtensionContext {
@@ -52,20 +55,106 @@ impl FrontendExtensionContext {
     pub fn serving_ready_display_names(&self) -> HashSet<String> {
         self.state.manager().serving_ready_display_names()
     }
+
+    /// Run one pinned Decider v1.2 sequence through the existing pooling engine.
+    /// Decode only the marker rows, not the full token-by-class matrix.
+    pub async fn decision_marker_logits(
+        &self,
+        model: &str,
+        ids: Vec<u32>,
+        markers: &[usize],
+    ) -> Result<Vec<Vec<f32>>, StatusCode> {
+        const WIDTH: usize = 255;
+        // Each packed float32 row divides evenly into base64 triplets.
+        const ROW_BYTES: usize = WIDTH * 4;
+        const ROW_CHARS: usize = ROW_BYTES / 3 * 4;
+        let n = ids.len();
+        if !(1..=32768).contains(&n)
+            || !(1..=64).contains(&markers.len())
+            || markers.iter().any(|&m| m >= n)
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let req = NvCreatePoolingRequest {
+            model: model.into(),
+            input: PoolingInput::Tokens(ids),
+            task: Some("token_classify".into()),
+            use_activation: Some(false),
+            encoding_format: PoolingEncodingFormat::Bytes,
+            embed_dtype: Some(PoolingEmbedDType::Float32),
+            endianness: Some(PoolingEndianness::Little),
+            add_special_tokens: Some(false),
+            user: None,
+            request_id: None,
+            priority: 0,
+            mm_processor_kwargs: None,
+            cache_salt: None,
+            truncation_side: None,
+            dimensions: None,
+            truncate_prompt_tokens: None,
+            nvext: None,
+        };
+        let (mut response, mut inflight) =
+            super::openai::execute_pooling(self.state.clone(), HeaderMap::new(), req)
+                .await
+                .map_err(|(status, _)| status)?;
+        let [item] = response.data.as_mut_slice() else {
+            return Err(StatusCode::BAD_GATEWAY);
+        };
+        if item.index != 0 || item.shape.as_deref() != Some(&[n as u64, WIDTH as u64][..]) {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        let PoolingOutput::Base64(data) = &item.data else {
+            return Err(StatusCode::BAD_GATEWAY);
+        };
+        if data.len() != n * ROW_CHARS {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        let mut rows = Vec::with_capacity(markers.len());
+        let mut decoded = [0; ROW_BYTES];
+        for &marker in markers {
+            let start = marker * ROW_CHARS;
+            let written = base64::engine::general_purpose::STANDARD
+                .decode_slice(&data.as_bytes()[start..start + ROW_CHARS], &mut decoded)
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            if written != ROW_BYTES {
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            rows.push(
+                decoded
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            );
+        }
+        inflight.mark_ok();
+        Ok(rows)
+    }
 }
 
-/// Routes returned by an extension. Built only via [`FrontendRouteSet::builder`],
-/// which records each route in both the router and its [`RouteDoc`] so the two
-/// can't drift.
+/// Routes returned by an extension. Each constructor records matching route docs.
 pub struct FrontendRouteSet {
     route_docs: Vec<RouteDoc>,
     router: Router,
 }
 
 impl FrontendRouteSet {
-    /// Start building a route set. Currently only `GET` routes are supported.
+    /// Start building a system route set. Only `GET` routes are supported.
     pub fn builder() -> FrontendRouteSetBuilder {
         FrontendRouteSetBuilder::default()
+    }
+
+    /// Build an inference route set separately from the system GET routes.
+    pub fn decisions<H, T>(handler: H) -> Self
+    where
+        H: Handler<T, ()>,
+        T: 'static,
+    {
+        const PATH: &str = "/v1/decisions";
+        Self {
+            route_docs: vec![RouteDoc::new(Method::POST, PATH)],
+            router: Router::new().route(PATH, post(handler)),
+        }
     }
 
     pub fn route_docs(&self) -> &[RouteDoc] {

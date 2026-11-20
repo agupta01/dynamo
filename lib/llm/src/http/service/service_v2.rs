@@ -1419,9 +1419,18 @@ impl HttpServiceConfigBuilder {
                 "frontend admin API disabled — busy_threshold routes not registered"
             );
         }
+        let mut inference_extensions = Vec::new();
         for extension in &config.frontend_route_extensions {
             let route_set = extension(FrontendExtensionContext::new(state.clone()))?;
-            system_routes.push(route_set.into_parts());
+            if route_set
+                .route_docs()
+                .iter()
+                .any(|doc| doc.method == axum::http::Method::POST)
+            {
+                inference_extensions.push(route_set.into_parts());
+            } else {
+                system_routes.push(route_set.into_parts());
+            }
         }
         let mut system_router = axum::Router::new();
         for (route_docs, route) in system_routes {
@@ -1438,7 +1447,7 @@ impl HttpServiceConfigBuilder {
             config.enable_batch_endpoints,
         )?;
         let mut inference_router = axum::Router::new();
-        for (route_docs, route) in endpoint_routes {
+        for (route_docs, route) in endpoint_routes.into_iter().chain(inference_extensions) {
             append_route_docs(&mut all_docs, &mut seen_route_docs, route_docs)?;
             inference_router = inference_router.merge(route);
         }
