@@ -18,8 +18,9 @@ The worker must already serve a **converted text-classifier checkpoint**, not
 the unmodified Hugging Face checkpoint. Use the matching noncausal text
 backbone and 255-class readout head from
 [`perplexity-ai/pplx-decider-v1.2` at `225c913`](https://huggingface.co/perplexity-ai/pplx-decider-v1.2/tree/225c913ddc8761a8264f04f64548e1f97e443eb3).
-Start the vLLM classify worker with the pooling runner, classification conversion
-and activation disabled. Do not enable prefix caching on this noncausal model.
+Start the vLLM worker with `--classify-worker --runner pooling --convert classify`.
+Disable activation with `--pooler-config '{"pooling_type":"LAST","use_activation":false}'`.
+Do not enable prefix caching on this noncausal model.
 
 Configure the HTTP frontend:
 
