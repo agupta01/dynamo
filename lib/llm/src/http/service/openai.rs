@@ -2305,7 +2305,38 @@ async fn pooling(
     body: Body,
 ) -> Result<Response, ErrorResponse> {
     let body = read_json_request_body(&headers, body).await?;
-    let mut request: NvCreatePoolingRequest = parse_json_request("pooling", &body)?;
+    let request: NvCreatePoolingRequest = parse_json_request("pooling", &body)?;
+    let encoding = request.encoding_format;
+    let dtype = request.embed_dtype.unwrap_or_default();
+    let endianness = request.endianness.unwrap_or_default();
+    let (response, mut inflight) = execute_pooling(state, headers, request).await?;
+    let response = match encoding {
+        PoolingEncodingFormat::Float | PoolingEncodingFormat::Base64 => {
+            Json(response).into_response()
+        }
+        PoolingEncodingFormat::Bytes | PoolingEncodingFormat::BytesOnly => {
+            build_pooling_binary_response(
+                response,
+                encoding == PoolingEncodingFormat::Bytes,
+                dtype,
+                endianness,
+            )
+            .map_err(|e| {
+                let error = ErrorMessage::from_anyhow(e, "Failed to build pooling binary response");
+                inflight.mark_error(extract_error_type_from_response(&error));
+                error
+            })?
+        }
+    };
+    inflight.mark_ok();
+    Ok(response)
+}
+
+pub(super) async fn execute_pooling(
+    state: Arc<service_v2::State>,
+    headers: HeaderMap,
+    mut request: NvCreatePoolingRequest,
+) -> Result<(NvCreatePoolingResponse, super::metrics::InflightGuard), ErrorResponse> {
     // return a 503 if the service or model is not ready
     check_ready(&state)?;
     check_model_serving_ready(&state, &request.model)?;
@@ -2320,10 +2351,6 @@ async fn pooling(
         );
         request.nvext = None;
     }
-    let response_encoding = request.encoding_format;
-    let response_dtype = request.embed_dtype.unwrap_or_default();
-    let response_endianness = request.endianness.unwrap_or_default();
-
     // Resolve alias → primary served name before wrapping the request, so
     // engine routing, metrics, and the response model all use the canonical
     // primary (mirrors `embeddings` / `completions_single`).
@@ -2416,28 +2443,7 @@ async fn pooling(
             err_response
         })?;
 
-    let response = match response_encoding {
-        PoolingEncodingFormat::Float | PoolingEncodingFormat::Base64 => {
-            Json(response).into_response()
-        }
-        PoolingEncodingFormat::Bytes | PoolingEncodingFormat::BytesOnly => {
-            build_pooling_binary_response(
-                response,
-                response_encoding == PoolingEncodingFormat::Bytes,
-                response_dtype,
-                response_endianness,
-            )
-            .map_err(|e| {
-                let err_response =
-                    ErrorMessage::from_anyhow(e, "Failed to build pooling binary response");
-                inflight.mark_error(extract_error_type_from_response(&err_response));
-                err_response
-            })?
-        }
-    };
-
-    inflight.mark_ok();
-    Ok(response)
+    Ok((response, inflight))
 }
 
 async fn handler_chat_completions(

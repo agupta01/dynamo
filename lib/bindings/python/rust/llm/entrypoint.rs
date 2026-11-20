@@ -1016,8 +1016,13 @@ pub fn run_input<'p>(
     frontend_route_extensions: Option<PyObject>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let input_enum: Input = input.parse().map_err(to_pyerr)?;
-    let frontend_route_extensions =
+    let mut frontend_route_extensions =
         super::frontend_routes::frontend_route_extensions_from_py(py, frontend_route_extensions)?;
+    if matches!(&input_enum, Input::Http)
+        && let Some(directory) = std::env::var_os("DYN_DECIDER_MODEL_DIR")
+    {
+        frontend_route_extensions.push(super::decisions::extension(py, directory.into())?);
+    }
     let plugins = crate::router_plugins(
         &engine_config
             .inner
